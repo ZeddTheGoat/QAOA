@@ -1,0 +1,6 @@
+qiskit>=2.4
+qiskit-aer>=0.17
+qiskit-ibm-runtime>=0.45
+networkx>=3.0
+scipy>=1.10
+matplotlib>=3.7
