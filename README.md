@@ -36,6 +36,8 @@ After the main noiseless experiment, the notebook also reruns the same instance 
 
 The results section explicitly reports the probability of sampling a globally optimal solution, which makes it easier to compare success rates across different settings.
 
+A final section compares different QAOA depths `p`. To keep larger-depth runs practical, it uses a Fourier warm-start heuristic inspired by the Lukin-group QAOA paper: the optimized angles from depth `p-1` are projected into a Fourier basis and extrapolated to initialize depth `p`.
+
 A typical way to start the notebook is:
 
 ```bash
@@ -89,15 +91,31 @@ python3 qaoa_maxcut.py --layers 3 --shots 4096 --restarts 12 --seed 42
 - `--restarts`: number of random restarts for the classical optimizer
 - `--seed`: random seed
 
+You can also switch from the default derivative-free optimizer to a gradient-based finite-difference SGD routine:
+
+```bash
+python3 qaoa_maxcut.py \
+  --optimizer SGD \
+  --sgd-steps 30 \
+  --sgd-learning-rate 0.10 \
+  --sgd-gradient-step 0.08 \
+  --sgd-learning-rate-decay 0.03
+```
+
+For noisy objectives, SGD may require more shots or more conservative hyperparameters because each update step estimates gradients from multiple circuit evaluations.
+
 ## Code Structure
 
 - `build_qaoa_circuit`: construct the QAOA circuit for Max-Cut
 - `build_maxcut_hamiltonian`: construct the Max-Cut cost Hamiltonian
 - `build_fake_backend`: instantiate a fake IBM backend
 - `build_fake_backend_simulator`: build an Aer noisy simulator from a fake IBM backend
+- `fourier_extrapolated_initial_params`: extrapolate QAOA angles from one depth to the next through a Fourier basis
 - `optimal_solution_probability`: compute the total probability of sampling a globally optimal solution
 - `optimize_qaoa`: run the sampler and classical optimizer to search for QAOA parameters
+- `SGDConfig`: configure the finite-difference SGD optimizer
 - `solve_maxcut_instance`: solve a given graph instance and return both the QAOA result and the exact optimum
+- `sweep_qaoa_layers`: compare depths `p = 1, ..., p_max` while reusing Fourier warm starts
 - `brute_force_maxcut`: compute the exact optimum by exhaustive search for validation
 - `draw_graph`: visualize the graph and partitioned cuts in the notebook
 - `plot_sampling_distribution`: plot the probability distribution over all possible bitstrings in fixed order, which makes symmetry easier to see

@@ -26,7 +26,7 @@ class OptimizationResult:
     expected_cut: float
     counts: dict[str, int]
     cut_distribution: dict[str, int]
-    objective_history: list[float]
+    iteration_history: list[float]
 
 
 @dataclass
@@ -37,11 +37,28 @@ class MaxCutSolution:
     exact_assignments: list[str]
 
 
+@dataclass
+class LayerSweepEntry:
+    layers: int
+    initial_params: np.ndarray | None
+    result: OptimizationResult
+    optimal_probability: float
+
+
+@dataclass
+class LayerSweepResult:
+    graph: nx.Graph
+    exact_cut: int
+    exact_assignments: list[str]
+    entries: list[LayerSweepEntry]
+
+
 @dataclass(frozen=True)
-class SimpleNoiseModelConfig:
-    single_qubit_gate_error: float = 0.001
-    two_qubit_gate_error: float = 0.01
-    readout_error: float = 0.02
+class SGDConfig:
+    steps: int = 40
+    learning_rate: float = 0.12
+    gradient_step: float = 0.1
+    learning_rate_decay: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -76,6 +93,37 @@ def parse_args() -> argparse.Namespace:
         default=7,
         help="Random seed for the optimizer and the sampler.",
     )
+    parser.add_argument(
+        "--optimizer",
+        type=str.lower,
+        default="cobyla",
+        choices=["cobyla", "sgd"],
+        help="Classical optimizer used for QAOA parameter search.",
+    )
+    parser.add_argument(
+        "--sgd-steps",
+        type=int,
+        default=40,
+        help="Number of SGD update steps when --optimizer SGD is used.",
+    )
+    parser.add_argument(
+        "--sgd-learning-rate",
+        type=float,
+        default=0.12,
+        help="Initial learning rate for SGD.",
+    )
+    parser.add_argument(
+        "--sgd-gradient-step",
+        type=float,
+        default=0.1,
+        help="Finite-difference step used to estimate SGD gradients.",
+    )
+    parser.add_argument(
+        "--sgd-learning-rate-decay",
+        type=float,
+        default=0.02,
+        help="Per-step learning-rate decay for SGD.",
+    )
     return parser.parse_args()
 
 
@@ -103,10 +151,6 @@ def build_graph(edges: Iterable[tuple[int, int]]) -> nx.Graph:
     graph = nx.Graph()
     graph.add_edges_from(edges)
     return nx.convert_node_labels_to_integers(graph, ordering="sorted")
-
-
-def create_example_graph() -> nx.Graph:
-    return build_graph(EXAMPLE_EDGES)
 
 
 def bitstring_to_assignment(bitstring: str, num_nodes: int) -> str:
@@ -187,37 +231,106 @@ def build_qaoa_circuit(graph: nx.Graph, layers: int) -> tuple[QuantumCircuit, Pa
     return circuit, gamma, beta
 
 
-def build_simple_noise_model(config: SimpleNoiseModelConfig | None = None):
-    if config is None:
-        config = SimpleNoiseModelConfig()
+def fourier_parameter_matrices(layers: int, modes: int) -> tuple[np.ndarray, np.ndarray]:
+    if layers <= 0:
+        raise ValueError("layers must be positive.")
+    if modes <= 0:
+        raise ValueError("modes must be positive.")
+    if modes > layers:
+        raise ValueError("modes cannot exceed layers.")
 
-    try:
-        from qiskit_aer.noise import NoiseModel, ReadoutError, depolarizing_error
-    except ImportError as exc:
-        raise ImportError(
-            "Noisy simulations require qiskit-aer. Install it with `pip install qiskit-aer`."
-        ) from exc
+    layer_indices = np.arange(1, layers + 1, dtype=float)[:, None]
+    mode_indices = np.arange(1, modes + 1, dtype=float)[None, :]
+    angles = (mode_indices - 0.5) * (layer_indices - 0.5) * np.pi / layers
+    return np.sin(angles), np.cos(angles)
 
-    noise_model = NoiseModel()
 
-    if config.single_qubit_gate_error > 0.0:
-        single_qubit_error = depolarizing_error(config.single_qubit_gate_error, 1)
-        noise_model.add_all_qubit_quantum_error(single_qubit_error, ["h", "rx", "rz"])
+def angles_to_fourier(
+    gamma: np.ndarray | list[float],
+    beta: np.ndarray | list[float],
+    modes: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    gamma_array = np.asarray(gamma, dtype=float)
+    beta_array = np.asarray(beta, dtype=float)
+    if gamma_array.ndim != 1 or beta_array.ndim != 1:
+        raise ValueError("gamma and beta must be one-dimensional arrays.")
+    if len(gamma_array) != len(beta_array):
+        raise ValueError("gamma and beta must have the same length.")
 
-    if config.two_qubit_gate_error > 0.0:
-        two_qubit_error = depolarizing_error(config.two_qubit_gate_error, 2)
-        noise_model.add_all_qubit_quantum_error(two_qubit_error, ["cx"])
+    layers = len(gamma_array)
+    if layers == 0:
+        raise ValueError("At least one QAOA layer is required.")
 
-    if config.readout_error > 0.0:
-        readout_error = ReadoutError(
-            [
-                [1.0 - config.readout_error, config.readout_error],
-                [config.readout_error, 1.0 - config.readout_error],
-            ]
-        )
-        noise_model.add_all_qubit_readout_error(readout_error)
+    if modes is None:
+        modes = layers
+    if modes <= 0:
+        raise ValueError("modes must be positive.")
 
-    return noise_model
+    sine_matrix, cosine_matrix = fourier_parameter_matrices(layers, min(modes, layers))
+    u, *_ = np.linalg.lstsq(sine_matrix, gamma_array, rcond=None)
+    v, *_ = np.linalg.lstsq(cosine_matrix, beta_array, rcond=None)
+    return u, v
+
+
+def fourier_to_angles(
+    layers: int,
+    u: np.ndarray | list[float],
+    v: np.ndarray | list[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    u_array = np.asarray(u, dtype=float)
+    v_array = np.asarray(v, dtype=float)
+    if u_array.ndim != 1 or v_array.ndim != 1:
+        raise ValueError("u and v must be one-dimensional arrays.")
+    if len(u_array) != len(v_array):
+        raise ValueError("u and v must have the same length.")
+    if len(u_array) == 0:
+        raise ValueError("At least one Fourier mode is required.")
+
+    sine_matrix, cosine_matrix = fourier_parameter_matrices(layers, len(u_array))
+    gamma = sine_matrix @ u_array
+    beta = cosine_matrix @ v_array
+    return gamma, beta
+
+
+def _wrap_qaoa_angles(gamma: np.ndarray, beta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    wrapped_gamma = np.mod(gamma, np.pi)
+    wrapped_beta = np.mod(beta, np.pi)
+    wrapped_beta = np.where(wrapped_beta > np.pi / 2, np.pi - wrapped_beta, wrapped_beta)
+    return wrapped_gamma, wrapped_beta
+
+
+def canonicalize_qaoa_params(params: np.ndarray | list[float]) -> np.ndarray:
+    params_array = np.asarray(params, dtype=float)
+    if params_array.ndim != 1 or len(params_array) % 2 != 0:
+        raise ValueError("params must contain concatenated gamma and beta values.")
+
+    layers = len(params_array) // 2
+    gamma = params_array[:layers]
+    beta = params_array[layers:]
+    wrapped_gamma, wrapped_beta = _wrap_qaoa_angles(gamma, beta)
+    return np.concatenate([wrapped_gamma, wrapped_beta])
+
+
+def fourier_extrapolated_initial_params(
+    previous_params: np.ndarray | list[float],
+    target_layers: int,
+    modes: int | None = None,
+) -> np.ndarray:
+    previous_array = np.asarray(previous_params, dtype=float)
+    if previous_array.ndim != 1 or len(previous_array) % 2 != 0:
+        raise ValueError("previous_params must contain concatenated gamma and beta values.")
+
+    previous_layers = len(previous_array) // 2
+    if target_layers <= 0:
+        raise ValueError("target_layers must be positive.")
+
+    gamma = previous_array[:previous_layers]
+    beta = previous_array[previous_layers:]
+    mode_count = min(previous_layers, target_layers, modes if modes is not None else previous_layers)
+    u, v = angles_to_fourier(gamma, beta, modes=mode_count)
+    extrapolated_gamma, extrapolated_beta = fourier_to_angles(target_layers, u, v)
+    wrapped_gamma, wrapped_beta = _wrap_qaoa_angles(extrapolated_gamma, extrapolated_beta)
+    return np.concatenate([wrapped_gamma, wrapped_beta])
 
 
 def build_fake_backend(config: FakeBackendConfig | None = None):
@@ -261,31 +374,18 @@ def sample_counts(
     params: np.ndarray | list[float],
     shots: int = 2048,
     seed: int = 7,
-    noise_model=None,
     simulator_backend=None,
 ) -> dict[str, int]:
+    canonical_params = canonicalize_qaoa_params(params)
+
     if simulator_backend is not None:
-        bound_circuit = circuit.assign_parameters(params)
+        bound_circuit = circuit.assign_parameters(canonical_params)
         compiled_circuit = transpile(bound_circuit, simulator_backend, optimization_level=0, seed_transpiler=seed)
         result = simulator_backend.run(compiled_circuit, shots=shots).result()
         return result.get_counts(0)
 
-    if noise_model is not None:
-        try:
-            from qiskit_aer import AerSimulator
-        except ImportError as exc:
-            raise ImportError(
-                "Noisy simulations require qiskit-aer. Install it with `pip install qiskit-aer`."
-            ) from exc
-
-        bound_circuit = circuit.assign_parameters(params)
-        backend = AerSimulator(noise_model=noise_model, seed_simulator=seed)
-        compiled_circuit = transpile(bound_circuit, backend, optimization_level=0, seed_transpiler=seed)
-        result = backend.run(compiled_circuit, shots=shots).result()
-        return result.get_counts(0)
-
     sampler = StatevectorSampler(default_shots=shots, seed=seed)
-    return sampler.run([(circuit, params)]).result()[0].data.meas.get_counts()
+    return sampler.run([(circuit, canonical_params)]).result()[0].data.meas.get_counts()
 
 
 def evaluate_counts(counts: dict[str, int], graph: nx.Graph) -> tuple[float, dict[str, int]]:
@@ -369,60 +469,144 @@ def plot_sampling_distribution(
     return ax
 
 
+def _random_initial_params(layers: int, rng: np.random.Generator) -> np.ndarray:
+    return np.concatenate(
+        [
+            rng.uniform(0.0, np.pi, size=layers),
+            rng.uniform(0.0, np.pi / 2, size=layers),
+        ]
+    )
+
+
+def _finite_difference_gradient(
+    objective,
+    params: np.ndarray,
+    step_size: float,
+) -> np.ndarray:
+    if step_size <= 0.0:
+        raise ValueError("gradient_step must be positive.")
+
+    gradient = np.zeros_like(params, dtype=float)
+    for index in range(len(params)):
+        shift = np.zeros_like(params, dtype=float)
+        shift[index] = step_size
+        forward = objective(canonicalize_qaoa_params(params + shift))
+        backward = objective(canonicalize_qaoa_params(params - shift))
+        gradient[index] = (forward - backward) / (2.0 * step_size)
+    return gradient
+
+
 def optimize_qaoa(
     graph: nx.Graph,
     layers: int,
     shots: int,
     restarts: int,
     seed: int,
-    noise_model=None,
+    initial_params: np.ndarray | list[float] | None = None,
+    optimizer: str = "COBYLA",
+    sgd_config: SGDConfig | None = None,
     simulator_backend=None,
 ) -> OptimizationResult:
     circuit, _, _ = build_qaoa_circuit(graph, layers)
     rng = np.random.default_rng(seed)
-    objective_history: list[float] = []
+    iteration_history: list[float] = []
+    optimizer_name = optimizer.lower()
 
-    def objective(params: np.ndarray) -> float:
+    if sgd_config is None:
+        sgd_config = SGDConfig()
+
+    def expected_cut_value(params: np.ndarray) -> float:
         counts = sample_counts(
             circuit,
             params,
             shots=shots,
             seed=seed,
-            noise_model=noise_model,
             simulator_backend=simulator_backend,
         )
         expected_cut, _ = evaluate_counts(counts, graph)
-        value = -expected_cut
-        objective_history.append(value)
-        return value
+        return expected_cut
 
-    best = None
-    bounds = [(0.0, np.pi)] * layers + [(0.0, np.pi / 2)] * layers
+    def objective(params: np.ndarray) -> float:
+        return -expected_cut_value(params)
 
-    for _ in range(restarts):
-        initial = np.concatenate(
-            [
-                rng.uniform(0.0, np.pi, size=layers),
-                rng.uniform(0.0, np.pi / 2, size=layers),
-            ]
-        )
-        result = minimize(objective, initial, method="COBYLA", bounds=bounds)
-        if best is None or result.fun < best.fun:
-            best = result
+    initial_guesses: list[np.ndarray] = []
 
-    if best is None:
+    if initial_params is not None:
+        warm_start = canonicalize_qaoa_params(initial_params)
+        if warm_start.shape != (2 * layers,):
+            raise ValueError(f"Expected {2 * layers} initial parameters, received {warm_start.shape}.")
+        initial_guesses.append(warm_start)
+
+    for _ in range(max(restarts - len(initial_guesses), 0)):
+        initial_guesses.append(_random_initial_params(layers, rng))
+
+    if not initial_guesses:
+        initial_guesses.append(_random_initial_params(layers, rng))
+
+    best_x = None
+    best_fun = None
+
+    if optimizer_name == "cobyla":
+        bounds = [(0.0, np.pi)] * layers + [(0.0, np.pi / 2)] * layers
+        for initial in initial_guesses:
+            local_iteration_history: list[float] = []
+
+            def tracked_objective(params: np.ndarray) -> float:
+                expected_cut = expected_cut_value(params)
+                local_iteration_history.append(expected_cut)
+                return -expected_cut
+
+            result = minimize(tracked_objective, np.asarray(initial, dtype=float), method="COBYLA", bounds=bounds)
+            if best_fun is None or result.fun < best_fun:
+                best_fun = float(result.fun)
+                best_x = np.asarray(result.x, dtype=float)
+                iteration_history = local_iteration_history.copy()
+    elif optimizer_name == "sgd":
+        for initial in initial_guesses:
+            params = canonicalize_qaoa_params(initial)
+            current_expected_cut = expected_cut_value(params)
+            current_value = -current_expected_cut
+            local_best_x = params.copy()
+            local_best_fun = current_value
+            local_iteration_history = [current_expected_cut]
+
+            for step in range(sgd_config.steps):
+                gradient = _finite_difference_gradient(objective, params, sgd_config.gradient_step)
+                learning_rate = sgd_config.learning_rate / (1.0 + sgd_config.learning_rate_decay * step)
+                params = canonicalize_qaoa_params(params - learning_rate * gradient)
+                current_expected_cut = expected_cut_value(params)
+                current_value = -current_expected_cut
+                local_iteration_history.append(current_expected_cut)
+                if current_value < local_best_fun:
+                    local_best_fun = current_value
+                    local_best_x = params.copy()
+
+            if best_fun is None or local_best_fun < best_fun:
+                best_fun = local_best_fun
+                best_x = local_best_x.copy()
+                iteration_history = local_iteration_history.copy()
+    else:
+        raise ValueError(f"Unsupported optimizer {optimizer!r}. Use 'COBYLA' or 'SGD'.")
+
+    if best_x is None or best_fun is None:
         raise RuntimeError("Optimization did not produce a result.")
 
+    canonical_best = canonicalize_qaoa_params(best_x)
     final_counts = sample_counts(
         circuit,
-        best.x,
+        canonical_best,
         shots=shots,
         seed=seed,
-        noise_model=noise_model,
         simulator_backend=simulator_backend,
     )
     expected_cut, cut_distribution = evaluate_counts(final_counts, graph)
-    return OptimizationResult(best.x, expected_cut, final_counts, cut_distribution, objective_history)
+    return OptimizationResult(
+        canonical_best,
+        expected_cut,
+        final_counts,
+        cut_distribution,
+        iteration_history,
+    )
 
 
 def solve_maxcut_instance(
@@ -433,7 +617,9 @@ def solve_maxcut_instance(
     shots: int = 2048,
     restarts: int = 8,
     seed: int = 7,
-    noise_model=None,
+    initial_params: np.ndarray | list[float] | None = None,
+    optimizer: str = "COBYLA",
+    sgd_config: SGDConfig | None = None,
     simulator_backend=None,
 ) -> MaxCutSolution:
     if graph is None:
@@ -447,11 +633,79 @@ def solve_maxcut_instance(
         shots=shots,
         restarts=restarts,
         seed=seed,
-        noise_model=noise_model,
+        initial_params=initial_params,
+        optimizer=optimizer,
+        sgd_config=sgd_config,
         simulator_backend=simulator_backend,
     )
     exact_cut, exact_assignments = brute_force_maxcut(graph)
     return MaxCutSolution(graph, result, exact_cut, exact_assignments)
+
+
+def sweep_qaoa_layers(
+    edges: Iterable[tuple[int, int]] | None = None,
+    *,
+    graph: nx.Graph | None = None,
+    max_layers: int,
+    shots: int = 2048,
+    restarts: int = 8,
+    seed: int = 7,
+    fourier_modes: int | None = None,
+    optimizer: str = "COBYLA",
+    sgd_config: SGDConfig | None = None,
+    simulator_backend=None,
+) -> LayerSweepResult:
+    if max_layers <= 0:
+        raise ValueError("max_layers must be positive.")
+    if fourier_modes is not None and fourier_modes <= 0:
+        raise ValueError("fourier_modes must be positive when provided.")
+
+    if graph is None:
+        if edges is None:
+            raise ValueError("Provide either edges or graph.")
+        graph = build_graph(edges)
+
+    exact_cut, exact_assignments = brute_force_maxcut(graph)
+    entries: list[LayerSweepEntry] = []
+    previous_params: np.ndarray | None = None
+
+    for layers in range(1, max_layers + 1):
+        initial_params = None
+        if previous_params is not None:
+            mode_count = min(fourier_modes if fourier_modes is not None else layers - 1, layers - 1)
+            initial_params = fourier_extrapolated_initial_params(
+                previous_params,
+                target_layers=layers,
+                modes=mode_count,
+            )
+
+        solution = solve_maxcut_instance(
+            graph=graph,
+            layers=layers,
+            shots=shots,
+            restarts=restarts,
+            seed=seed,
+            initial_params=initial_params,
+            optimizer=optimizer,
+            sgd_config=sgd_config,
+            simulator_backend=simulator_backend,
+        )
+        optimal_probability = optimal_solution_probability(
+            solution.result.counts,
+            graph,
+            exact_assignments,
+        )
+        entries.append(
+            LayerSweepEntry(
+                layers=layers,
+                initial_params=initial_params,
+                result=solution.result,
+                optimal_probability=optimal_probability,
+            )
+        )
+        previous_params = solution.result.x
+
+    return LayerSweepResult(graph, exact_cut, exact_assignments, entries)
 
 
 def draw_graph(
@@ -546,12 +800,20 @@ def print_report(graph: nx.Graph, result: OptimizationResult, layers: int) -> No
 
 def main() -> None:
     args = parse_args()
+    sgd_config = SGDConfig(
+        steps=args.sgd_steps,
+        learning_rate=args.sgd_learning_rate,
+        gradient_step=args.sgd_gradient_step,
+        learning_rate_decay=args.sgd_learning_rate_decay,
+    )
     solution = solve_maxcut_instance(
         edges=parse_edges(args.edges),
         layers=args.layers,
         shots=args.shots,
         restarts=args.restarts,
         seed=args.seed,
+        optimizer=args.optimizer,
+        sgd_config=sgd_config,
     )
     print_report(solution.graph, solution.result, args.layers)
 
